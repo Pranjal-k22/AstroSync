@@ -52,57 +52,55 @@ async function callGroqInterpret(
   systemInstruction: string,
   prompt: string
 ): Promise<AIInterpretationResponse | null> {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+  const candidateModels = ['openai/gpt-oss-120b', 'llama3-8b-8192', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b'];
 
-    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${groqApiKey}`,
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages: [
-          { role: 'system', content: systemInstruction },
-          { role: 'user', content: prompt },
-        ],
-        temperature: 0.65,
-        response_format: { type: 'json_object' },
-      }),
-    });
+  for (const model of candidateModels) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-    clearTimeout(timeoutId);
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${groqApiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            { role: 'user', content: prompt },
+          ],
+          temperature: 0.65,
+          response_format: { type: 'json_object' },
+        }),
+      });
 
-    if (!groqRes.ok) {
-      const errText = await groqRes.text();
-      console.error('[api/interpret] Groq fallback API error:', groqRes.status, errText);
-      return null;
+      clearTimeout(timeoutId);
+
+      if (groqRes.ok) {
+        const data = (await groqRes.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+
+        const text = data?.choices?.[0]?.message?.content;
+        if (text) {
+          const parsed = JSON.parse(text);
+          if (validateResponse(parsed)) {
+            return parsed;
+          }
+        }
+      } else {
+        const errText = await groqRes.text();
+        console.warn(`[api/interpret] Groq model ${model} returned ${groqRes.status}: ${errText}`);
+      }
+    } catch (err) {
+      console.warn(`[api/interpret] Groq exception for model ${model}:`, err);
     }
-
-    const data = (await groqRes.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-
-    const text = data?.choices?.[0]?.message?.content;
-    if (!text) {
-      console.error('[api/interpret] Empty text from Groq fallback');
-      return null;
-    }
-
-    const parsed = JSON.parse(text);
-    if (!validateResponse(parsed)) {
-      console.error('[api/interpret] Groq response schema mismatch:', JSON.stringify(parsed));
-      return null;
-    }
-
-    return parsed;
-  } catch (err) {
-    console.error('[api/interpret] Groq fallback exception:', err);
-    return null;
   }
+
+  return null;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {

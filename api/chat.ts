@@ -99,60 +99,63 @@ async function callGroqChat(
   normalizedHistory: NormalizedMessage[],
   currentMessage: string
 ): Promise<string | null> {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+  const candidateModels = ['openai/gpt-oss-120b', 'llama3-8b-8192', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b'];
 
-    const messages = [
-      { role: 'system', content: systemInstruction },
-      {
-        role: 'user',
-        content: `I'm asking about ${personAName} and ${personBName}'s compatibility. Start ready to answer questions.`,
-      },
-      {
-        role: 'assistant',
-        content: `Of course! I've got ${personAName} and ${personBName}'s cosmic profile right in front of me. What would you like to explore? ✨`,
-      },
-      ...normalizedHistory.map((m) => ({
-        role: m.role === 'user' ? 'user' : 'assistant',
-        content: m.text,
-      })),
-      { role: 'user', content: currentMessage.trim() },
-    ];
+  const messages = [
+    { role: 'system', content: systemInstruction },
+    {
+      role: 'user',
+      content: `I'm asking about ${personAName} and ${personBName}'s compatibility. Start ready to answer questions.`,
+    },
+    {
+      role: 'assistant',
+      content: `Of course! I've got ${personAName} and ${personBName}'s cosmic profile right in front of me. What would you like to explore? ✨`,
+    },
+    ...normalizedHistory.map((m) => ({
+      role: m.role === 'user' ? 'user' : 'assistant',
+      content: m.text,
+    })),
+    { role: 'user', content: currentMessage.trim() },
+  ];
 
-    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${groqApiKey}`,
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        model: 'llama-3.3-70b-versatile',
-        messages,
-        temperature: 0.75,
-        max_tokens: 300,
-      }),
-    });
+  for (const model of candidateModels) {
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-    clearTimeout(timeoutId);
+      const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${groqApiKey}`,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          model,
+          messages,
+          temperature: 0.75,
+          max_tokens: 300,
+        }),
+      });
 
-    if (!groqRes.ok) {
-      const errText = await groqRes.text();
-      console.error('[api/chat] Groq fallback API error:', groqRes.status, errText);
-      return null;
+      clearTimeout(timeoutId);
+
+      if (groqRes.ok) {
+        const data = (await groqRes.json()) as {
+          choices?: Array<{ message?: { content?: string } }>;
+        };
+        const reply = data?.choices?.[0]?.message?.content?.trim();
+        if (reply) return reply;
+      } else {
+        const errText = await groqRes.text();
+        console.warn(`[api/chat] Groq model ${model} failed (${groqRes.status}): ${errText}`);
+      }
+    } catch (err) {
+      console.warn(`[api/chat] Groq exception for model ${model}:`, err);
     }
-
-    const data = (await groqRes.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-    };
-
-    const reply = data?.choices?.[0]?.message?.content?.trim();
-    return reply || null;
-  } catch (err) {
-    console.error('[api/chat] Groq fallback exception:', err);
-    return null;
   }
+
+  return null;
 }
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
