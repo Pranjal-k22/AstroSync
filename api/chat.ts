@@ -34,17 +34,22 @@ interface ChatPayload {
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Method not allowed. Use POST.' });
+    return res.status(405).json({ error: 'Method not allowed. Use POST.', reason: 'invalid_request' });
   }
 
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY is not configured.' });
+    console.error('[api/chat] Error: GEMINI_API_KEY is not configured in process.env');
+    return res.status(500).json({ error: 'GEMINI_API_KEY is not configured.', reason: 'missing_api_key' });
   }
 
   const body = req.body as ChatPayload;
-  if (!body?.message || !body?.personAName || !body?.personBName) {
-    return res.status(400).json({ error: 'message, personAName, and personBName are required.' });
+  if (!body || !body.message || !body.personAName || !body.personBName) {
+    console.error('[api/chat] Error: Invalid request body received:', JSON.stringify(body));
+    return res.status(400).json({
+      error: 'message, personAName, and personBName are required.',
+      reason: 'invalid_request',
+    });
   }
 
   const {
@@ -53,26 +58,26 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     personBName,
     personAZodiac: zA,
     personBZodiac: zB,
-    overallScore,
-    categories,
-    signals,
-    strengths,
-    challenges,
+    overallScore = 0,
+    categories = { communication: 0, emotional: 0, romance: 0, conflict: 0, growth: 0 },
+    signals = [],
+    strengths = [],
+    challenges = [],
     history = [],
   } = body;
 
   // Trim history to last 6 exchanges to keep context tight
-  const recentHistory = history.slice(-6);
+  const recentHistory = Array.isArray(history) ? history.slice(-6) : [];
 
   const systemInstruction = `You are a warm, playful astrology companion for AstroSync, discussing the compatibility between ${personAName} (${zA?.name ?? 'Unknown'} ${zA?.symbol ?? ''}) and ${personBName} (${zB?.name ?? 'Unknown'} ${zB?.symbol ?? ''}).
 
 Here is their compatibility context (do NOT repeat these numbers verbatim — weave them into natural conversation):
 • Overall Match: ${overallScore}%
-• Communication: ${categories.communication}%, Emotional: ${categories.emotional}%, Romance: ${categories.romance}%, Conflict: ${categories.conflict}%, Growth: ${categories.growth}%
+• Communication: ${categories?.communication ?? 0}%, Emotional: ${categories?.emotional ?? 0}%, Romance: ${categories?.romance ?? 0}%, Conflict: ${categories?.conflict ?? 0}%, Growth: ${categories?.growth ?? 0}%
 • Element pairing: ${zA?.element ?? '?'} × ${zB?.element ?? '?'} | Modality: ${zA?.modality ?? '?'} × ${zB?.modality ?? '?'}
-• Signals: ${signals.join(', ')}
-• Strengths: ${strengths.join('; ')}
-• Friction: ${challenges.join('; ')}
+• Signals: ${(signals ?? []).join(', ')}
+• Strengths: ${(strengths ?? []).join('; ')}
+• Friction: ${(challenges ?? []).join('; ')}
 
 ABSOLUTE RULES:
 1. Frame all "future" answers as playful astrological perspective — use hedged, exploratory language: "the stars suggest", "one way to read this is", "this pairing tends to".
@@ -119,8 +124,8 @@ ABSOLUTE RULES:
         system_instruction: { parts: [{ text: systemInstruction }] },
         contents,
         generationConfig: {
-          temperature: 0.8,
-          maxOutputTokens: 200, // ~120 words hard cap
+          temperature: 0.75,
+          maxOutputTokens: 800,
         },
       }),
     });
@@ -129,26 +134,37 @@ ABSOLUTE RULES:
 
     if (!geminiRes.ok) {
       const errText = await geminiRes.text();
-      console.error('[api/chat] Gemini error:', geminiRes.status, errText);
-      return res.status(502).json({ error: 'Gemini API returned an error' });
+      console.error('[api/chat] Gemini API error response:', geminiRes.status, errText);
+      return res.status(502).json({
+        error: 'Gemini API returned an error',
+        reason: 'gemini_error',
+        status: geminiRes.status,
+        details: errText,
+      });
     }
 
-    const data = await geminiRes.json() as {
+    const data = (await geminiRes.json()) as {
       candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
     };
 
     const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
     if (!reply) {
-      return res.status(502).json({ error: 'Empty response from Gemini' });
+      console.error('[api/chat] Empty reply candidate from Gemini:', JSON.stringify(data));
+      return res.status(502).json({ error: 'Empty response from Gemini', reason: 'gemini_error' });
     }
 
     return res.status(200).json({ reply });
   } catch (err: unknown) {
     clearTimeout(timeoutId);
     if (err instanceof Error && err.name === 'AbortError') {
-      return res.status(504).json({ error: 'Request timed out' });
+      console.error('[api/chat] Gemini request timed out (>8s)');
+      return res.status(504).json({ error: 'Request timed out (>8s)', reason: 'timeout' });
     }
-    console.error('[api/chat] Error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    console.error('[api/chat] Unexpected server exception:', err);
+    return res.status(500).json({
+      error: 'Internal server error',
+      reason: 'gemini_error',
+      details: err instanceof Error ? err.message : String(err),
+    });
   }
 }
