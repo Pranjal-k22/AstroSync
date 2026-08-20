@@ -941,10 +941,14 @@ export const ResultPage: React.FC = () => {
                         // Scroll to bottom
                         setTimeout(() => chatEndRef.current?.scrollIntoView({ behavior: 'smooth' }), 50);
 
+                        const controller = new AbortController();
+                        const timeoutId = setTimeout(() => controller.abort(), 8000);
+
                         try {
                           const response = await fetch('/api/chat', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
+                            signal: controller.signal,
                             body: JSON.stringify({
                               message: msg,
                               personAName: personA.name,
@@ -971,6 +975,8 @@ export const ResultPage: React.FC = () => {
                             }),
                           });
 
+                          clearTimeout(timeoutId);
+
                           if (!response.ok) {
                             throw new Error('non-ok response');
                           }
@@ -983,6 +989,7 @@ export const ResultPage: React.FC = () => {
                             ]);
                           }
                         } catch {
+                          clearTimeout(timeoutId);
                           setChatError('The stars are quiet right now — try again in a moment.');
                         } finally {
                           setChatLoading(false);
