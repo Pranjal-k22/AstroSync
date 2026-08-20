@@ -88,15 +88,16 @@ async function callGroqInterpret(
         if (text) {
           const parsed = JSON.parse(text);
           if (validateResponse(parsed)) {
+            console.log(`[provider:groq] Synastry interpretation generated with model: ${model}`);
             return parsed;
           }
         }
       } else {
         const errText = await groqRes.text();
-        console.warn(`[api/interpret] Groq model ${model} returned ${groqRes.status}: ${errText}`);
+        console.error(`[provider:groq] Model ${model} returned HTTP ${groqRes.status}: ${errText}`);
       }
     } catch (err) {
-      console.warn(`[api/interpret] Groq exception for model ${model}:`, err);
+      console.error(`[provider:groq] Exception for model ${model}:`, err);
     }
   }
 
@@ -108,11 +109,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed. Use POST.' });
   }
 
-  const geminiApiKey = process.env.GEMINI_API_KEY;
   const groqApiKey = process.env.GROQ_API_KEY;
-
-  if (!geminiApiKey && !groqApiKey) {
-    return res.status(500).json({ error: 'Neither GEMINI_API_KEY nor GROQ_API_KEY is configured.' });
+  if (!groqApiKey) {
+    console.error('[api/interpret] Error: GROQ_API_KEY is not configured in process.env');
+    return res.status(500).json({ error: 'GROQ_API_KEY is not configured on this server.' });
   }
 
   const payload = req.body as AIInterpretationPayload;
@@ -148,7 +148,6 @@ ABSOLUTE RULES — violations cause the response to be discarded:
   "funObservation": "string — one witty, light-hearted observation about this element/modality pairing"
 }`;
 
-  // Rich astrological reasoning prompt — includes full trait data so Gemini can reason, not just restate
   const prompt = `Analyse the synastry between ${personAName} (${zA.name} ${zA.symbol}) and ${personBName} (${zB.name} ${zB.symbol}).
 
 === ASTROLOGICAL PROFILES ===
@@ -179,65 +178,10 @@ Constructive friction: ${challenges.join('; ')}
 
 Reason about WHY these two signs interact this way based on the elemental and modality dynamics above. Ground each response field in the actual trait data, not just the scores.`;
 
-  // 1. Try Gemini first if key exists
-  if (geminiApiKey) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-    try {
-      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${geminiApiKey}`;
-
-      const geminiRes = await fetch(geminiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          system_instruction: { parts: [{ text: systemInstruction }] },
-          contents: [{ parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: 0.65,
-            responseMimeType: 'application/json',
-          },
-        }),
-      });
-
-      clearTimeout(timeoutId);
-
-      if (geminiRes.ok) {
-        const data = (await geminiRes.json()) as {
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-        };
-
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-        if (text) {
-          try {
-            const parsed = JSON.parse(text);
-            if (validateResponse(parsed)) {
-              console.log('[provider] gemini');
-              return res.status(200).json(parsed);
-            }
-          } catch {
-            console.error('[api/interpret] Gemini JSON parse failed');
-          }
-        }
-      } else {
-        const errText = await geminiRes.text();
-        console.warn(`[api/interpret] Gemini returned status ${geminiRes.status}: ${errText}. Falling back to Groq...`);
-      }
-    } catch (err: unknown) {
-      clearTimeout(timeoutId);
-      console.warn('[api/interpret] Gemini exception, falling back to Groq...', err);
-    }
+  const groqResult = await callGroqInterpret(groqApiKey, systemInstruction, prompt);
+  if (groqResult) {
+    return res.status(200).json(groqResult);
   }
 
-  // 2. Fallback to Groq
-  if (groqApiKey) {
-    const groqResult = await callGroqInterpret(groqApiKey, systemInstruction, prompt);
-    if (groqResult) {
-      console.log('[provider] groq');
-      return res.status(200).json(groqResult);
-    }
-  }
-
-  return res.status(502).json({ error: 'All AI interpretation providers failed or timed out' });
+  return res.status(502).json({ error: 'AI interpretation generation failed' });
 }

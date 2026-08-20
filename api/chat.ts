@@ -83,7 +83,7 @@ async function callGroqChat(
         };
         const reply = data?.choices?.[0]?.message?.content?.trim();
         if (reply) {
-          console.log(`[provider:groq] Success using model: ${model}`);
+          console.log(`[provider:groq] Chat response generated with model: ${model}`);
           return reply;
         }
       } else {
@@ -103,12 +103,10 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed. Use POST.', reason: 'invalid_request' });
   }
 
-  const geminiApiKey = process.env.GEMINI_API_KEY;
   const groqApiKey = process.env.GROQ_API_KEY;
-
-  if (!geminiApiKey && !groqApiKey) {
-    console.error('[api/chat] Error: Neither GEMINI_API_KEY nor GROQ_API_KEY is configured');
-    return res.status(500).json({ error: 'API keys are not configured.', reason: 'missing_api_key' });
+  if (!groqApiKey) {
+    console.error('[api/chat] Error: GROQ_API_KEY is not configured in process.env');
+    return res.status(500).json({ error: 'GROQ_API_KEY is not configured on this server.', reason: 'missing_api_key' });
   }
 
   const body = req.body as ChatPayload;
@@ -161,81 +159,19 @@ ABSOLUTE RULES:
     }))
     .filter((msg) => msg.parts[0].text.trim() !== '');
 
-  // TEMPORARY TEST HOOK - REMOVE BEFORE FINAL SUBMISSION
-  const forceFallbackHeader = req.headers['x-force-fallback'] === 'true';
-  const forceFallbackQuery = req.query?.testFallback === 'true';
-  const shouldForceFallback = forceFallbackHeader || forceFallbackQuery;
+  const groqReply = await callGroqChat(
+    groqApiKey,
+    systemInstruction,
+    cleanHistory,
+    message
+  );
 
-  if (shouldForceFallback) {
-    console.log('[test] Forcing fallback to Groq for testing');
-  }
-
-  // 1. Try Gemini first if key exists (unless force-fallback is triggered for testing)
-  if (geminiApiKey && !shouldForceFallback) {
-    const contents = [
-      ...cleanHistory,
-      { role: 'user' as const, parts: [{ text: message.trim() }] },
-    ];
-
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${geminiApiKey}`;
-
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 8000);
-
-      const geminiRes = await fetch(geminiUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        signal: controller.signal,
-        body: JSON.stringify({
-          system_instruction: { parts: [{ text: systemInstruction }] },
-          contents,
-          generationConfig: {
-            temperature: 0.75,
-            maxOutputTokens: 800,
-          },
-        }),
-      });
-
-      clearTimeout(timeoutId);
-
-      if (geminiRes.ok) {
-        const data = (await geminiRes.json()) as {
-          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-        };
-
-        const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-        if (reply) {
-          console.log('[provider:gemini] Success');
-          return res.status(200).json({ reply });
-        }
-      } else {
-        const errText = await geminiRes.text();
-        console.error(`[provider:gemini] Request failed with HTTP ${geminiRes.status}: ${errText}. Attempting Groq fallback...`);
-      }
-    } catch (err: unknown) {
-      console.error('[provider:gemini] Exception during Gemini call. Attempting Groq fallback...', err);
-    }
-  }
-
-  // 2. Fallback to Groq if available
-  if (groqApiKey) {
-    console.log('[provider:groq] Attempting Groq fallback...');
-    const groqReply = await callGroqChat(
-      groqApiKey,
-      systemInstruction,
-      cleanHistory,
-      message
-    );
-    if (groqReply) {
-      return res.status(200).json({ reply: groqReply });
-    }
-  } else {
-    console.error('[api/chat] GROQ_API_KEY is not set in process.env (required for fallback when Gemini quota is exhausted)');
+  if (groqReply) {
+    return res.status(200).json({ reply: groqReply });
   }
 
   return res.status(502).json({
-    error: 'All AI chat providers failed or timed out',
-    reason: 'gemini_error',
+    error: 'AI chat provider failed or timed out',
+    reason: 'groq_error',
   });
 }
