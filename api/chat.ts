@@ -161,8 +161,17 @@ ABSOLUTE RULES:
     }))
     .filter((msg) => msg.parts[0].text.trim() !== '');
 
-  // 1. Try Gemini first if key exists
-  if (geminiApiKey) {
+  // TEMPORARY TEST HOOK - REMOVE BEFORE FINAL SUBMISSION
+  const forceFallbackHeader = req.headers['x-force-fallback'] === 'true';
+  const forceFallbackQuery = req.query?.testFallback === 'true';
+  const shouldForceFallback = forceFallbackHeader || forceFallbackQuery;
+
+  if (shouldForceFallback) {
+    console.log('[test] Forcing fallback to Groq for testing');
+  }
+
+  // 1. Try Gemini first if key exists (unless force-fallback is triggered for testing)
+  if (geminiApiKey && !shouldForceFallback) {
     const contents = [
       ...cleanHistory,
       { role: 'user' as const, parts: [{ text: message.trim() }] },
