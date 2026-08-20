@@ -172,6 +172,6 @@ ABSOLUTE RULES:
 
   return res.status(502).json({
     error: 'AI chat provider failed or timed out',
-    reason: 'groq_error',
+    reason: 'provider_error',
   });
 }
