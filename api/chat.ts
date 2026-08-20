@@ -216,35 +216,19 @@ ABSOLUTE RULES:
 
   // 1. Try Gemini first if key exists
   if (geminiApiKey) {
-    // Build Gemini multi-turn contents array with strict alternating roles
-    const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [
-      {
-        role: 'user',
-        parts: [{ text: `I'm asking about ${personAName} and ${personBName}'s compatibility. Start ready to answer questions.` }],
-      },
-      {
-        role: 'model',
-        parts: [{ text: `Of course! I've got ${personAName} and ${personBName}'s cosmic profile right in front of me. What would you like to explore? ✨` }],
-      },
+    // Aggressive sanitization mapping for Gemini multi-turn contents
+    const incomingHistory = (Array.isArray(history) ? history : []).slice(-6);
+    const cleanHistory = incomingHistory
+      .map((msg: any) => ({
+        role: (msg.role === 'user' || msg.sender === 'user') ? ('user' as const) : ('model' as const),
+        parts: [{ text: String(msg.text || msg.content || msg.message || '') }],
+      }))
+      .filter((msg: any) => msg.parts[0].text.trim() !== '');
+
+    const contents = [
+      ...cleanHistory,
+      { role: 'user' as const, parts: [{ text: message.trim() }] },
     ];
-
-    // Append history ensuring alternating turns
-    for (const item of normalizedHistory) {
-      const lastTurn = contents[contents.length - 1];
-      if (lastTurn && lastTurn.role === item.role) {
-        lastTurn.parts[0].text += `\n\n${item.text}`;
-      } else {
-        contents.push({ role: item.role, parts: [{ text: item.text }] });
-      }
-    }
-
-    // Append current user message
-    const lastTurn = contents[contents.length - 1];
-    if (lastTurn && lastTurn.role === 'user') {
-      lastTurn.parts[0].text += `\n\n${message.trim()}`;
-    } else {
-      contents.push({ role: 'user', parts: [{ text: message.trim() }] });
-    }
 
     const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${geminiApiKey}`;
 
