@@ -29,93 +29,30 @@ interface ChatPayload {
   signals: string[];
   strengths: string[];
   challenges: string[];
-  history: ChatMessage[]; // last 4–6 messages, sent from frontend state
+  history: ChatMessage[];
 }
 
-interface NormalizedMessage {
+interface CleanTurn {
   role: 'user' | 'model';
-  text: string;
-}
-
-function normalizeHistory(rawHistory: unknown): NormalizedMessage[] {
-  if (!Array.isArray(rawHistory)) {
-    if (rawHistory !== undefined && rawHistory !== null) {
-      console.warn('[api/chat] History was not an array, falling back to empty list:', typeof rawHistory);
-    }
-    return [];
-  }
-
-  const normalized: NormalizedMessage[] = [];
-  let droppedCount = 0;
-  let normalizedRoleCount = 0;
-
-  for (const raw of rawHistory) {
-    if (!raw || typeof raw !== 'object') {
-      droppedCount++;
-      continue;
-    }
-
-    const item = raw as Record<string, unknown>;
-
-    // 1. Extract and map role (only 'user' and 'model' allowed in Gemini API)
-    const rawRole = String(item.role ?? item.sender ?? item.author ?? '').toLowerCase().trim();
-    let role: 'user' | 'model';
-    if (rawRole === 'user') {
-      role = 'user';
-    } else if (['assistant', 'ai', 'bot', 'model'].includes(rawRole)) {
-      if (rawRole !== 'model') normalizedRoleCount++;
-      role = 'model';
-    } else {
-      normalizedRoleCount++;
-      role = 'model';
-    }
-
-    // 2. Fall back to .text -> .content -> .message
-    const rawText = item.text ?? item.content ?? item.message;
-    const text = typeof rawText === 'string' ? rawText.trim() : '';
-
-    if (!text) {
-      droppedCount++;
-      continue;
-    }
-
-    normalized.push({ role, text });
-  }
-
-  if (droppedCount > 0 || normalizedRoleCount > 0) {
-    console.warn(
-      `[api/chat] History normalized: ${normalized.length} valid entries retained (${droppedCount} dropped/empty, ${normalizedRoleCount} roles mapped to 'model').`
-    );
-  }
-
-  return normalized;
+  parts: Array<{ text: string }>;
 }
 
 async function callGroqChat(
   groqApiKey: string,
   systemInstruction: string,
-  personAName: string,
-  personBName: string,
-  normalizedHistory: NormalizedMessage[],
+  cleanHistory: CleanTurn[],
   currentMessage: string
 ): Promise<string | null> {
   const candidateModels = ['openai/gpt-oss-120b', 'llama3-8b-8192', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b'];
 
+  // OpenAI chat completion message format: [{ role: 'system' | 'user' | 'assistant', content: string }]
   const messages = [
-    { role: 'system', content: systemInstruction },
-    {
-      role: 'user',
-      content: `I'm asking about ${personAName} and ${personBName}'s compatibility. Start ready to answer questions.`,
-    },
-    {
-      role: 'assistant',
-      content: `Of course! I've got ${personAName} and ${personBName}'s cosmic profile right in front of me. What would you like to explore? ✨`,
-    },
-    ...normalizedHistory.map((m) => ({
-      role: m.role === 'user' ? 'user' : 'assistant',
-      content: m.text,
+    { role: 'system' as const, content: systemInstruction },
+    ...cleanHistory.map((m) => ({
+      role: m.role === 'user' ? ('user' as const) : ('assistant' as const),
+      content: m.parts[0]?.text || '',
     })),
-    { role: 'user', content: currentMessage.trim() },
+    { role: 'user' as const, content: currentMessage.trim() },
   ];
 
   for (const model of candidateModels) {
@@ -145,13 +82,16 @@ async function callGroqChat(
           choices?: Array<{ message?: { content?: string } }>;
         };
         const reply = data?.choices?.[0]?.message?.content?.trim();
-        if (reply) return reply;
+        if (reply) {
+          console.log(`[provider:groq] Success using model: ${model}`);
+          return reply;
+        }
       } else {
         const errText = await groqRes.text();
-        console.warn(`[api/chat] Groq model ${model} failed (${groqRes.status}): ${errText}`);
+        console.error(`[provider:groq] Model ${model} failed with HTTP ${groqRes.status}: ${errText}`);
       }
-    } catch (err) {
-      console.warn(`[api/chat] Groq exception for model ${model}:`, err);
+    } catch (err: unknown) {
+      console.error(`[provider:groq] Exception connecting to model ${model}:`, err);
     }
   }
 
@@ -194,8 +134,6 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     history = [],
   } = body;
 
-  const normalizedHistory = normalizeHistory(history).slice(-6);
-
   const systemInstruction = `You are a warm, playful astrology companion for AstroSync, discussing the compatibility between ${personAName} (${zA?.name ?? 'Unknown'} ${zA?.symbol ?? ''}) and ${personBName} (${zB?.name ?? 'Unknown'} ${zB?.symbol ?? ''}).
 
 Here is their compatibility context (do NOT repeat these numbers verbatim — weave them into natural conversation):
@@ -214,17 +152,17 @@ ABSOLUTE RULES:
 5. Stay on topic: this pair's compatibility, their signs, and relationship dynamics. If asked something unrelated, redirect warmly back to the stars.
 6. Never repeat the same sentence structure twice in a row. Keep the conversation feeling alive.`;
 
+  // Aggressive sanitization mapping for multi-turn history
+  const incomingHistory = (Array.isArray(history) ? history : []).slice(-6);
+  const cleanHistory: CleanTurn[] = incomingHistory
+    .map((msg: any) => ({
+      role: (msg.role === 'user' || msg.sender === 'user') ? ('user' as const) : ('model' as const),
+      parts: [{ text: String(msg.text || msg.content || msg.message || '') }],
+    }))
+    .filter((msg) => msg.parts[0].text.trim() !== '');
+
   // 1. Try Gemini first if key exists
   if (geminiApiKey) {
-    // Aggressive sanitization mapping for Gemini multi-turn contents
-    const incomingHistory = (Array.isArray(history) ? history : []).slice(-6);
-    const cleanHistory = incomingHistory
-      .map((msg: any) => ({
-        role: (msg.role === 'user' || msg.sender === 'user') ? ('user' as const) : ('model' as const),
-        parts: [{ text: String(msg.text || msg.content || msg.message || '') }],
-      }))
-      .filter((msg: any) => msg.parts[0].text.trim() !== '');
-
     const contents = [
       ...cleanHistory,
       { role: 'user' as const, parts: [{ text: message.trim() }] },
@@ -259,32 +197,32 @@ ABSOLUTE RULES:
 
         const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
         if (reply) {
-          console.log('[provider] gemini');
+          console.log('[provider:gemini] Success');
           return res.status(200).json({ reply });
         }
       } else {
         const errText = await geminiRes.text();
-        console.warn(`[api/chat] Gemini returned status ${geminiRes.status}: ${errText}. Attempting Groq fallback...`);
+        console.error(`[provider:gemini] Request failed with HTTP ${geminiRes.status}: ${errText}. Attempting Groq fallback...`);
       }
     } catch (err: unknown) {
-      console.warn('[api/chat] Gemini request failed or timed out. Attempting Groq fallback...', err);
+      console.error('[provider:gemini] Exception during Gemini call. Attempting Groq fallback...', err);
     }
   }
 
   // 2. Fallback to Groq if available
   if (groqApiKey) {
+    console.log('[provider:groq] Attempting Groq fallback...');
     const groqReply = await callGroqChat(
       groqApiKey,
       systemInstruction,
-      personAName,
-      personBName,
-      normalizedHistory,
+      cleanHistory,
       message
     );
     if (groqReply) {
-      console.log('[provider] groq');
       return res.status(200).json({ reply: groqReply });
     }
+  } else {
+    console.error('[api/chat] GROQ_API_KEY is not set in process.env (required for fallback when Gemini quota is exhausted)');
   }
 
   return res.status(502).json({
