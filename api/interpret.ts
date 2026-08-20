@@ -47,14 +47,74 @@ function validateResponse(obj: unknown): obj is AIInterpretationResponse {
   return required.every((k) => typeof (obj as Record<string, unknown>)[k] === 'string');
 }
 
+async function callGroqInterpret(
+  groqApiKey: string,
+  systemInstruction: string,
+  prompt: string
+): Promise<AIInterpretationResponse | null> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${groqApiKey}`,
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          { role: 'system', content: systemInstruction },
+          { role: 'user', content: prompt },
+        ],
+        temperature: 0.65,
+        response_format: { type: 'json_object' },
+      }),
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!groqRes.ok) {
+      const errText = await groqRes.text();
+      console.error('[api/interpret] Groq fallback API error:', groqRes.status, errText);
+      return null;
+    }
+
+    const data = (await groqRes.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) {
+      console.error('[api/interpret] Empty text from Groq fallback');
+      return null;
+    }
+
+    const parsed = JSON.parse(text);
+    if (!validateResponse(parsed)) {
+      console.error('[api/interpret] Groq response schema mismatch:', JSON.stringify(parsed));
+      return null;
+    }
+
+    return parsed;
+  } catch (err) {
+    console.error('[api/interpret] Groq fallback exception:', err);
+    return null;
+  }
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed. Use POST.' });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on this server.' });
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const groqApiKey = process.env.GROQ_API_KEY;
+
+  if (!geminiApiKey && !groqApiKey) {
+    return res.status(500).json({ error: 'Neither GEMINI_API_KEY nor GROQ_API_KEY is configured.' });
   }
 
   const payload = req.body as AIInterpretationPayload;
@@ -121,63 +181,65 @@ Constructive friction: ${challenges.join('; ')}
 
 Reason about WHY these two signs interact this way based on the elemental and modality dynamics above. Ground each response field in the actual trait data, not just the scores.`;
 
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 8000);
+  // 1. Try Gemini first if key exists
+  if (geminiApiKey) {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
 
-  try {
-    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-
-    const geminiRes = await fetch(geminiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      signal: controller.signal,
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: systemInstruction }] },
-        contents: [{ parts: [{ text: prompt }] }],
-        generationConfig: {
-          temperature: 0.65,
-          responseMimeType: 'application/json',
-        },
-      }),
-    });
-
-    clearTimeout(timeoutId);
-
-    if (!geminiRes.ok) {
-      const errText = await geminiRes.text();
-      console.error('[api/interpret] Gemini API error:', geminiRes.status, errText);
-      return res.status(502).json({ error: 'Gemini API returned an error' });
-    }
-
-    const data = await geminiRes.json() as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-    };
-
-    const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) {
-      return res.status(502).json({ error: 'Empty response from Gemini API' });
-    }
-
-    let parsed: unknown;
     try {
-      parsed = JSON.parse(text);
-    } catch {
-      console.error('[api/interpret] JSON parse error. Raw text:', text.slice(0, 300));
-      return res.status(502).json({ error: 'Failed to parse Gemini response as JSON' });
-    }
+      const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${geminiApiKey}`;
 
-    if (!validateResponse(parsed)) {
-      console.error('[api/interpret] Response shape invalid:', JSON.stringify(parsed).slice(0, 300));
-      return res.status(502).json({ error: 'Gemini response did not match expected schema' });
-    }
+      const geminiRes = await fetch(geminiUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: systemInstruction }] },
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: {
+            temperature: 0.65,
+            responseMimeType: 'application/json',
+          },
+        }),
+      });
 
-    return res.status(200).json(parsed);
-  } catch (err: unknown) {
-    clearTimeout(timeoutId);
-    if (err instanceof Error && err.name === 'AbortError') {
-      return res.status(504).json({ error: 'Gemini API request timed out (>8s)' });
+      clearTimeout(timeoutId);
+
+      if (geminiRes.ok) {
+        const data = (await geminiRes.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        };
+
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (text) {
+          try {
+            const parsed = JSON.parse(text);
+            if (validateResponse(parsed)) {
+              console.log('[provider] gemini');
+              return res.status(200).json(parsed);
+            }
+          } catch {
+            console.error('[api/interpret] Gemini JSON parse failed');
+          }
+        }
+      } else {
+        const errText = await geminiRes.text();
+        console.warn(`[api/interpret] Gemini returned status ${geminiRes.status}: ${errText}. Falling back to Groq...`);
+      }
+    } catch (err: unknown) {
+      clearTimeout(timeoutId);
+      console.warn('[api/interpret] Gemini exception, falling back to Groq...', err);
     }
-    console.error('[api/interpret] Error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
   }
+
+  // 2. Fallback to Groq
+  if (groqApiKey) {
+    const groqResult = await callGroqInterpret(groqApiKey, systemInstruction, prompt);
+    if (groqResult) {
+      console.log('[provider] groq');
+      return res.status(200).json(groqResult);
+    }
+  }
+
+  return res.status(502).json({ error: 'All AI interpretation providers failed or timed out' });
 }

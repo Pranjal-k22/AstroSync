@@ -91,15 +91,81 @@ function normalizeHistory(rawHistory: unknown): NormalizedMessage[] {
   return normalized;
 }
 
+async function callGroqChat(
+  groqApiKey: string,
+  systemInstruction: string,
+  personAName: string,
+  personBName: string,
+  normalizedHistory: NormalizedMessage[],
+  currentMessage: string
+): Promise<string | null> {
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 8000);
+
+    const messages = [
+      { role: 'system', content: systemInstruction },
+      {
+        role: 'user',
+        content: `I'm asking about ${personAName} and ${personBName}'s compatibility. Start ready to answer questions.`,
+      },
+      {
+        role: 'assistant',
+        content: `Of course! I've got ${personAName} and ${personBName}'s cosmic profile right in front of me. What would you like to explore? ✨`,
+      },
+      ...normalizedHistory.map((m) => ({
+        role: m.role === 'user' ? 'user' : 'assistant',
+        content: m.text,
+      })),
+      { role: 'user', content: currentMessage.trim() },
+    ];
+
+    const groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${groqApiKey}`,
+      },
+      signal: controller.signal,
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages,
+        temperature: 0.75,
+        max_tokens: 300,
+      }),
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!groqRes.ok) {
+      const errText = await groqRes.text();
+      console.error('[api/chat] Groq fallback API error:', groqRes.status, errText);
+      return null;
+    }
+
+    const data = (await groqRes.json()) as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+
+    const reply = data?.choices?.[0]?.message?.content?.trim();
+    return reply || null;
+  } catch (err) {
+    console.error('[api/chat] Groq fallback exception:', err);
+    return null;
+  }
+}
+
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') {
     return res.status(405).json({ error: 'Method not allowed. Use POST.', reason: 'invalid_request' });
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    console.error('[api/chat] Error: GEMINI_API_KEY is not configured in process.env');
-    return res.status(500).json({ error: 'GEMINI_API_KEY is not configured.', reason: 'missing_api_key' });
+  const geminiApiKey = process.env.GEMINI_API_KEY;
+  const groqApiKey = process.env.GROQ_API_KEY;
+
+  if (!geminiApiKey && !groqApiKey) {
+    console.error('[api/chat] Error: Neither GEMINI_API_KEY nor GROQ_API_KEY is configured');
+    return res.status(500).json({ error: 'API keys are not configured.', reason: 'missing_api_key' });
   }
 
   const body = req.body as ChatPayload;
@@ -145,44 +211,44 @@ ABSOLUTE RULES:
 5. Stay on topic: this pair's compatibility, their signs, and relationship dynamics. If asked something unrelated, redirect warmly back to the stars.
 6. Never repeat the same sentence structure twice in a row. Keep the conversation feeling alive.`;
 
-  // Build Gemini multi-turn contents array with strict alternating roles
-  const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [
-    {
-      role: 'user',
-      parts: [{ text: `I'm asking about ${personAName} and ${personBName}'s compatibility. Start ready to answer questions.` }],
-    },
-    {
-      role: 'model',
-      parts: [{ text: `Of course! I've got ${personAName} and ${personBName}'s cosmic profile right in front of me. What would you like to explore? ✨` }],
-    },
-  ];
+  // 1. Try Gemini first if key exists
+  if (geminiApiKey) {
+    // Build Gemini multi-turn contents array with strict alternating roles
+    const contents: Array<{ role: 'user' | 'model'; parts: Array<{ text: string }> }> = [
+      {
+        role: 'user',
+        parts: [{ text: `I'm asking about ${personAName} and ${personBName}'s compatibility. Start ready to answer questions.` }],
+      },
+      {
+        role: 'model',
+        parts: [{ text: `Of course! I've got ${personAName} and ${personBName}'s cosmic profile right in front of me. What would you like to explore? ✨` }],
+      },
+    ];
 
-  // Append history ensuring alternating turns
-  for (const item of normalizedHistory) {
-    const lastTurn = contents[contents.length - 1];
-    if (lastTurn && lastTurn.role === item.role) {
-      lastTurn.parts[0].text += `\n\n${item.text}`;
-    } else {
-      contents.push({ role: item.role, parts: [{ text: item.text }] });
+    // Append history ensuring alternating turns
+    for (const item of normalizedHistory) {
+      const lastTurn = contents[contents.length - 1];
+      if (lastTurn && lastTurn.role === item.role) {
+        lastTurn.parts[0].text += `\n\n${item.text}`;
+      } else {
+        contents.push({ role: item.role, parts: [{ text: item.text }] });
+      }
     }
-  }
 
-  // Append current user message
-  const lastTurn = contents[contents.length - 1];
-  if (lastTurn && lastTurn.role === 'user') {
-    lastTurn.parts[0].text += `\n\n${message.trim()}`;
-  } else {
-    contents.push({ role: 'user', parts: [{ text: message.trim() }] });
-  }
+    // Append current user message
+    const lastTurn = contents[contents.length - 1];
+    if (lastTurn && lastTurn.role === 'user') {
+      lastTurn.parts[0].text += `\n\n${message.trim()}`;
+    } else {
+      contents.push({ role: 'user', parts: [{ text: message.trim() }] });
+    }
 
-  const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`;
-  const maxAttempts = 2;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 8000);
+    const geminiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${geminiApiKey}`;
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+
       const geminiRes = await fetch(geminiUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -199,59 +265,43 @@ ABSOLUTE RULES:
 
       clearTimeout(timeoutId);
 
-      // Retry once on rate limit (429) or transient backend error (503)
-      if ((geminiRes.status === 429 || geminiRes.status === 503) && attempt < maxAttempts) {
-        console.warn(`[api/chat] Gemini returned ${geminiRes.status} on attempt ${attempt}. Retrying after 1000ms...`);
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        continue;
-      }
+      if (geminiRes.ok) {
+        const data = (await geminiRes.json()) as {
+          candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+        };
 
-      if (!geminiRes.ok) {
-        const errText = await geminiRes.text();
-        console.error(`[api/chat] Gemini API error (attempt ${attempt}):`, geminiRes.status, errText);
-        return res.status(502).json({
-          error: 'Gemini API returned an error',
-          reason: 'gemini_error',
-          status: geminiRes.status,
-          details: errText,
-        });
-      }
-
-      const data = (await geminiRes.json()) as {
-        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
-      };
-
-      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-      if (!reply) {
-        console.error('[api/chat] Empty reply candidate from Gemini:', JSON.stringify(data));
-        return res.status(502).json({ error: 'Empty response from Gemini', reason: 'gemini_error' });
-      }
-
-      return res.status(200).json({ reply });
-    } catch (err: unknown) {
-      clearTimeout(timeoutId);
-
-      if (err instanceof Error && err.name === 'AbortError') {
-        console.error(`[api/chat] Gemini request timed out (>8s) on attempt ${attempt}`);
-        if (attempt < maxAttempts) {
-          console.warn('[api/chat] Retrying once after timeout...');
-          await new Promise((resolve) => setTimeout(resolve, 1000));
-          continue;
+        const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+        if (reply) {
+          console.log('[provider] gemini');
+          return res.status(200).json({ reply });
         }
-        return res.status(504).json({ error: 'Request timed out (>8s)', reason: 'timeout' });
+      } else {
+        const errText = await geminiRes.text();
+        console.warn(`[api/chat] Gemini returned status ${geminiRes.status}: ${errText}. Attempting Groq fallback...`);
       }
-
-      console.error(`[api/chat] Unexpected error on attempt ${attempt}:`, err);
-      if (attempt < maxAttempts) {
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-        continue;
-      }
-
-      return res.status(500).json({
-        error: 'Internal server error',
-        reason: 'gemini_error',
-        details: err instanceof Error ? err.message : String(err),
-      });
+    } catch (err: unknown) {
+      console.warn('[api/chat] Gemini request failed or timed out. Attempting Groq fallback...', err);
     }
   }
+
+  // 2. Fallback to Groq if available
+  if (groqApiKey) {
+    const groqReply = await callGroqChat(
+      groqApiKey,
+      systemInstruction,
+      personAName,
+      personBName,
+      normalizedHistory,
+      message
+    );
+    if (groqReply) {
+      console.log('[provider] groq');
+      return res.status(200).json({ reply: groqReply });
+    }
+  }
+
+  return res.status(502).json({
+    error: 'All AI chat providers failed or timed out',
+    reason: 'gemini_error',
+  });
 }
