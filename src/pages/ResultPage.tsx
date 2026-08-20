@@ -970,8 +970,14 @@ export const ResultPage: React.FC = () => {
                               signals: result.signals,
                               strengths: result.strengths,
                               challenges: result.challenges,
-                              // Send last 6 messages as rolling context (not including the one just sent)
-                              history: chatMessages.slice(-6),
+                              // Send last 6 messages as rolling context in exact { role: 'user' | 'model', text: string } shape
+                              history: chatMessages
+                                .slice(-6)
+                                .map((m) => ({
+                                  role: (m.role === 'user' ? 'user' : 'model') as 'user' | 'model',
+                                  text: String(m.text || '').trim(),
+                                }))
+                                .filter((m) => Boolean(m.text)),
                             }),
                           });
 
